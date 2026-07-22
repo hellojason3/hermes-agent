@@ -21,6 +21,50 @@ logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
 
+# IMPORTANT: socket.setsockopt() on Linux SILENTLY IGNORES unknown options.
+# TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT are AF_INET (IPv4)-only options —
+# they are silently ignored on AF_INET6 (IPv6) sockets. Since DNS resolution
+# returns IPv6 addresses first, the actual sockets created by httpx are IPv6
+# and these options are dropped.  We force IPv4-only connections so the keepalive
+# options take effect.
+def _build_tcp_keepalive_options() -> list[tuple[int, int, int]]:
+    """Build TCP keepalive options, verifying they are supported on IPv4."""
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        logger.debug(
+            "[Telegram] Socket creation unavailable; TCP keepalive disabled"
+        )
+        return []
+    try:
+        options: list[tuple[int, int, int]] = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5),
+        ]
+        for level, opt, value in options:
+            test_sock.setsockopt(level, opt, value)
+        return options
+    except OSError:
+        try:
+            fallback = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+            for level, opt, value in fallback:
+                test_sock.setsockopt(level, opt, value)
+            logger.debug(
+                "[Telegram] TCP keepalive options not fully supported; "
+                "falling back to SO_KEEPALIVE only (OS defaults will apply)"
+            )
+            return fallback
+        except OSError:
+            logger.warning("[Telegram] SO_KEEPALIVE not available; no keepalive enabled")
+            return []
+    finally:
+        test_sock.close()
+
+
+_TCP_KEEPALIVE_OPTIONS: list[tuple[int, int, int]] = _build_tcp_keepalive_options()
+
 # DNS-over-HTTPS providers used to discover Telegram API IPs that may differ
 # from the (potentially unreachable) IP returned by the local system resolver.
 _DOH_TIMEOUT = 4.0  # seconds — bounded so connect() isn't noticeably delayed
@@ -58,11 +102,24 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     ``curl --resolve api.telegram.org:443:<ip>``.
     """
 
-    def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
+    def __init__(
+        self,
+        fallback_ips: Iterable[str],
+        **transport_kwargs,
+    ):
         self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
+        # Apply TCP keepalive to ALL transports (primary + fallbacks) so that
+        # dead/half-closed sockets are detected at the OS level regardless of
+        # whether the request goes through the primary DNS path or a fallback IP.
+        # Keepalive probes: 30s idle → 5 probes × 10s interval → ≈80s to detect.
+        if (
+            "socket_options" not in transport_kwargs
+            and _TCP_KEEPALIVE_OPTIONS
+        ):
+            transport_kwargs["socket_options"] = _TCP_KEEPALIVE_OPTIONS
         self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
         self._fallbacks = {
             ip: httpx.AsyncHTTPTransport(**transport_kwargs) for ip in self._fallback_ips
