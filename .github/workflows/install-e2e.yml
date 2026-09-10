@@ -62,6 +62,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
+      has_tags: ${{ steps.pick.outputs.has_tags }}
     steps:
       # This job only reads tag names and runs one script, so take the cheap
       # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
@@ -75,13 +76,38 @@ jobs:
       - id: pick
         run: |
           set -euo pipefail
+          release_re='^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
+          local_tags="$(git tag --list 'v*' | grep -E "$release_re" || true)"
+          if [ -z "$local_tags" ]; then
+            # Distinguishes "this repo has no releases" (forks, copies) from
+            # "checkout forgot to fetch tags". The latter is a real CI bug
+            # and must still fail; the former is not, and used to fail this
+            # scheduled workflow every 12 hours.
+            remote_tags="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
+              | awk '{print $2}' | sed 's#^refs/tags/##' | grep -E "$release_re" || true)"
+            if [ -n "$remote_tags" ]; then
+              echo "error: origin has release tags but this checkout has none." >&2
+              echo "       A shallow clone has no tags: fetch with tags (actions/checkout" >&2
+              echo "       with fetch-depth: 0, or fetch-tags: true)." >&2
+              exit 1
+            fi
+            echo "No release tags in this repository; skipping install/update E2E."
+            echo "Forks typically have none unless they publish their own releases."
+            echo "has_tags=false" >> "$GITHUB_OUTPUT"
+            echo "tags=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "has_tags=true" >> "$GITHUB_OUTPUT"
 
   # `hermes update` -- the route most users take.
+  # has_tags must be in this if: an explicit if replaces GHA's implicit
+  # success() check, so a skipped/empty pick-releases would otherwise try
+  # to expand fromJSON('') / fromJSON('[]') and fail the matrix.
   update:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'installer'
+    if: ${{ needs.pick-releases.outputs.has_tags == 'true' && (github.event_name != 'workflow_dispatch' || inputs.route != 'installer') }}
     needs: pick-releases
     strategy:
       # One release breaking is worth knowing about even if another already
@@ -97,7 +123,7 @@ jobs:
   # Re-running the curl one-liner over an existing checkout: autostash + pull
   # rather than the updater's own git handling.
   installer:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
+    if: ${{ needs.pick-releases.outputs.has_tags == 'true' && (github.event_name != 'workflow_dispatch' || inputs.route != 'update') }}
     needs: pick-releases
     strategy:
       fail-fast: false
